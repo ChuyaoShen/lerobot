@@ -46,6 +46,7 @@ from lerobot.utils.feature_utils import dataset_to_policy_features
 
 from .act.configuration_act import ACTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig
+from .gr3.configuration_gr3 import GR3Config
 from .groot.configuration_groot import GrootConfig
 from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 from .pi0.configuration_pi0 import PI0Config
@@ -144,6 +145,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from .sarm.modeling_sarm import SARMRewardModel
 
         return SARMRewardModel
+    elif name == "gr3":
+        from .gr3.modeling_gr3 import GR3Policy
+
+        return GR3Policy
     elif name == "groot":
         from .groot.modeling_groot import GrootPolicy
 
@@ -202,6 +207,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return SmolVLAConfig(**kwargs)
     elif policy_type == "reward_classifier":
         return RewardClassifierConfig(**kwargs)
+    elif policy_type == "gr3":
+        return GR3Config(**kwargs)
     elif policy_type == "groot":
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
@@ -402,6 +409,14 @@ def make_pre_post_processors(
             dataset_stats=kwargs.get("dataset_stats"),
             dataset_meta=kwargs.get("dataset_meta"),
         )
+    elif isinstance(policy_cfg, GR3Config):
+        from .gr3.processor_gr3 import make_gr3_pre_post_processors
+
+        processors = make_gr3_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
+
     elif isinstance(policy_cfg, GrootConfig):
         from .groot.processor_groot import make_groot_pre_post_processors
 
