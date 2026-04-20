@@ -462,7 +462,7 @@ class GR3Model(nn.Module):
             num_vlm_layers = len(all_hidden) - 1  # exclude embedding output
             latter_half_start = num_vlm_layers // 2
             # all_hidden[i+1] = output of VLM layer i (0-indexed)
-            latter_half = list(all_hidden[latter_half_start + 1:])
+            latter_half = list(all_hidden[latter_half_start + 1 :])
 
         if len(latter_half) != self.config.dit_num_layers:
             raise ValueError(
@@ -473,7 +473,6 @@ class GR3Model(nn.Module):
             )
 
         return latter_half
-
 
     def forward(
         self,
@@ -544,7 +543,7 @@ class GR3Model(nn.Module):
             )
 
         # ── Decode predicted velocity (only action portion) ──
-        pred_velocity = self.action_decoder(dit_output[:, -actions_rep.shape[1]:])
+        pred_velocity = self.action_decoder(dit_output[:, -actions_rep.shape[1] :])
 
         # ── Per-element MSE loss ──
         losses = (pred_velocity - velocity_target) ** 2
@@ -620,7 +619,7 @@ class GR3Model(nn.Module):
                 )
 
             # Decode velocity
-            pred_velocity = self.action_decoder(dit_output[:, -self.config.chunk_size:])
+            pred_velocity = self.action_decoder(dit_output[:, -self.config.chunk_size :])
 
             # Euler step
             actions = actions + dt * pred_velocity

@@ -57,17 +57,10 @@ class GR3LanguageProcessor(ComplementaryDataProcessorStep):
     def _format_prompt(self, task: str) -> str:
         """Build a Qwen2.5-VL chat prompt with image pad tokens."""
         image_placeholder = (
-            "<|vision_start|>"
-            + "<|image_pad|>" * self.num_image_tokens_per_image
-            + "<|vision_end|>"
+            "<|vision_start|>" + "<|image_pad|>" * self.num_image_tokens_per_image + "<|vision_end|>"
         )
         image_section = "".join(image_placeholder for _ in range(self.num_cameras))
-        return (
-            f"<|im_start|>user\n"
-            f"{image_section}"
-            f"{task}<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
+        return f"<|im_start|>user\n{image_section}{task}<|im_end|>\n<|im_start|>assistant\n"
 
     def complementary_data(self, complementary_data):
         if "task" not in complementary_data:

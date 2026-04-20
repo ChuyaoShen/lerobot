@@ -126,7 +126,7 @@ class GR3Config(PreTrainedConfig):
         H, W = self.image_resolution
         grid_h = H // self.vision_patch_size
         grid_w = W // self.vision_patch_size
-        return (grid_h * grid_w) // (self.vision_merge_size ** 2)
+        return (grid_h * grid_w) // (self.vision_merge_size**2)
 
     def __post_init__(self):
         super().__post_init__()
