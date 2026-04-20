@@ -28,7 +28,7 @@ from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature, PreTr
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
-DEFAULT_IMAGE_SIZE = 384
+DEFAULT_IMAGE_SIZE = 392  # Must be a multiple of patch_size(14) * spatial_merge_size(2) = 28
 
 
 @PreTrainedConfig.register_subclass("gr3")
@@ -110,7 +110,23 @@ class GR3Config(PreTrainedConfig):
     scheduler_decay_lr: float = 2.5e-6
 
     # ── Tokenizer ──
-    tokenizer_max_length: int = 256  # Qwen2.5-VL supports longer sequences
+    tokenizer_max_length: int = 1024  # Must accommodate image pad tokens + task text
+
+    # ── VLM vision constants (Qwen2.5-VL defaults) ──
+    vision_patch_size: int = 14
+    vision_merge_size: int = 2
+
+    @property
+    def num_image_tokens_per_image(self) -> int:
+        """Number of ``<|image_pad|>`` tokens per image for Qwen2.5-VL.
+
+        Derived from image_resolution, patch_size, and merge_size:
+        ``grid_h * grid_w / merge_size²`` (grid_t = 1 for static images).
+        """
+        H, W = self.image_resolution
+        grid_h = H // self.vision_patch_size
+        grid_w = W // self.vision_patch_size
+        return (grid_h * grid_w) // (self.vision_merge_size ** 2)
 
     def __post_init__(self):
         super().__post_init__()

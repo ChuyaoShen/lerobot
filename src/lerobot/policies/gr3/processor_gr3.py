@@ -43,10 +43,31 @@ from .configuration_gr3 import GR3Config
 
 @ProcessorStepRegistry.register(name="gr3_language_processor")
 class GR3LanguageProcessor(ComplementaryDataProcessorStep):
-    """Ensures the task description is properly formatted for Qwen2.5-VL.
+    """Formats task descriptions as Qwen2.5-VL chat prompts with image placeholders.
 
-    Wraps the task description in the Qwen2.5-VL chat format if needed.
+    Wraps each task string in the Qwen2.5-VL chat template, inserting the
+    correct number of ``<|image_pad|>`` tokens per camera so that the VLM
+    can inject vision features at the right positions in ``input_ids``.
     """
+
+    def __init__(self, num_cameras: int = 1, num_image_tokens_per_image: int = 196):
+        self.num_cameras = num_cameras
+        self.num_image_tokens_per_image = num_image_tokens_per_image
+
+    def _format_prompt(self, task: str) -> str:
+        """Build a Qwen2.5-VL chat prompt with image pad tokens."""
+        image_placeholder = (
+            "<|vision_start|>"
+            + "<|image_pad|>" * self.num_image_tokens_per_image
+            + "<|vision_end|>"
+        )
+        image_section = "".join(image_placeholder for _ in range(self.num_cameras))
+        return (
+            f"<|im_start|>user\n"
+            f"{image_section}"
+            f"{task}<|im_end|>\n"
+            f"<|im_start|>assistant\n"
+        )
 
     def complementary_data(self, complementary_data):
         if "task" not in complementary_data:
@@ -58,10 +79,9 @@ class GR3LanguageProcessor(ComplementaryDataProcessorStep):
 
         new_data = dict(complementary_data)
         if isinstance(task, str):
-            if not task.endswith("\n"):
-                new_data["task"] = f"{task}\n"
+            new_data["task"] = self._format_prompt(task)
         elif isinstance(task, list) and all(isinstance(t, str) for t in task):
-            new_data["task"] = [t if t.endswith("\n") else f"{t}\n" for t in task]
+            new_data["task"] = [self._format_prompt(t) for t in task]
 
         return new_data
 
@@ -95,7 +115,10 @@ def make_gr3_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-        GR3LanguageProcessor(),
+        GR3LanguageProcessor(
+            num_cameras=len(config.image_features),
+            num_image_tokens_per_image=config.num_image_tokens_per_image,
+        ),
         TokenizerProcessorStep(
             tokenizer_name=config.vlm_model_name,
             max_length=config.tokenizer_max_length,

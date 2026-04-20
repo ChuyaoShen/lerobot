@@ -320,14 +320,17 @@ class GR3DiT(nn.Module):
     def forward(
         self,
         hidden_states: Tensor,
-        encoder_hidden_states: Tensor,
+        encoder_hidden_states: list[Tensor],
         timestep: Tensor,
         encoder_attention_mask: Tensor | None = None,
     ) -> Tensor:
         """
         Args:
             hidden_states: (B, T_action, inner_dim) - action/state sequence
-            encoder_hidden_states: (B, T_vlm, vlm_hidden_size) - VLM features
+            encoder_hidden_states: list of (B, T_vlm, vlm_hidden_size) - per-layer
+                VLM hidden states from the latter half, one per DiT layer.
+                Cross-attention layers use their paired VLM layer; self-attention
+                layers ignore theirs.
             timestep: (B,) - discretized timesteps
             encoder_attention_mask: (B, T_vlm) - attention mask for VLM tokens
         Returns:
@@ -342,7 +345,7 @@ class GR3DiT(nn.Module):
             else:
                 hidden_states = block(
                     hidden_states,
-                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states[idx],
                     encoder_attention_mask=encoder_attention_mask,
                     temb=temb,
                 )
@@ -433,75 +436,49 @@ class GR3Model(nn.Module):
 
     def _encode_vlm(
         self,
-        images: list[Tensor],
-        img_masks: list[Tensor],
+        pixel_values: Tensor | None,
+        image_grid_thw: Tensor | None,
         lang_tokens: Tensor,
         lang_masks: Tensor,
-    ) -> Tensor:
+    ) -> list[Tensor]:
         """Encode images + language through Qwen2.5-VL backbone.
 
-        Returns the last hidden state from the VLM.
+        Returns hidden states from the latter half of VLM layers for
+        layerwise cross-attention in the DiT. Each DiT layer i is paired
+        1-to-1 with VLM latter-half layer i (per the GR-3 paper: "the action
+        DiT utilizes only the KV cache from the latter half of the VLM layers").
         """
-        # For Qwen2.5-VL, we pass images through the visual encoder directly
-        # and get hidden states from the language model with image features
         with torch.autocast("cuda", dtype=torch.bfloat16):
             outputs = self.vlm(
                 input_ids=lang_tokens,
                 attention_mask=lang_masks,
-                pixel_values=self._prepare_pixel_values(images, img_masks),
-                image_grid_thw=self._compute_image_grid_thw(images, img_masks),
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            hidden_states = outputs.hidden_states[-1]  # (B, seq_len, hidden_size)
+            # outputs.hidden_states is (embedding_output, layer_0, ..., layer_N-1)
+            all_hidden = outputs.hidden_states
+            num_vlm_layers = len(all_hidden) - 1  # exclude embedding output
+            latter_half_start = num_vlm_layers // 2
+            # all_hidden[i+1] = output of VLM layer i (0-indexed)
+            latter_half = list(all_hidden[latter_half_start + 1:])
 
-        return hidden_states
+        if len(latter_half) != self.config.dit_num_layers:
+            raise ValueError(
+                f"Expected {self.config.dit_num_layers} VLM latter-half hidden states "
+                f"(dit_num_layers), but got {len(latter_half)} "
+                f"(VLM has {num_vlm_layers} layers, latter half = {num_vlm_layers - latter_half_start}). "
+                f"Ensure dit_num_layers == num_vlm_layers // 2."
+            )
 
-    def _prepare_pixel_values(self, images: list[Tensor], img_masks: list[Tensor]) -> Tensor | None:
-        """Prepare pixel values for Qwen2.5-VL from image list."""
-        real_images = []
-        for img, mask in zip(images, img_masks, strict=True):
-            if mask.any():
-                real_images.append(img)
+        return latter_half
 
-        if not real_images:
-            return None
-
-        # Stack along batch dimension, Qwen2.5-VL expects (B*num_images, C, H, W)
-        # but we handle per-batch-item, so concatenate all real images
-        all_pixels = []
-        for img in real_images:
-            all_pixels.append(img)
-
-        return torch.cat(all_pixels, dim=0)
-
-    def _compute_image_grid_thw(self, images: list[Tensor], img_masks: list[Tensor]) -> Tensor | None:
-        """Compute image grid (temporal, height, width) for Qwen2.5-VL."""
-        real_images = []
-        for img, mask in zip(images, img_masks, strict=True):
-            if mask.any():
-                real_images.append(img)
-
-        if not real_images:
-            return None
-
-        # For static images: t=1, h=img_h/patch_size, w=img_w/patch_size
-        # Qwen2.5-VL patch size is 14
-        patch_size = 14
-        grid_thws = []
-        for img in real_images:
-            _, _, h, w = img.shape
-            grid_h = h // patch_size
-            grid_w = w // patch_size
-            for _ in range(img.shape[0]):
-                grid_thws.append([1, grid_h, grid_w])
-
-        return torch.tensor(grid_thws, device=real_images[0].device, dtype=torch.long)
 
     def forward(
         self,
-        images: list[Tensor],
-        img_masks: list[Tensor],
+        pixel_values: Tensor | None,
+        image_grid_thw: Tensor | None,
         lang_tokens: Tensor,
         lang_masks: Tensor,
         state: Tensor,
@@ -510,8 +487,8 @@ class GR3Model(nn.Module):
         """Training forward pass with flow matching loss.
 
         Args:
-            images: list of (B, C, H, W) image tensors
-            img_masks: list of (B,) boolean masks
+            pixel_values: (total_patches, C*tp*p*p) from image processor, or None
+            image_grid_thw: (num_images, 3) from image processor, or None
             lang_tokens: (B, seq_len) tokenized language
             lang_masks: (B, seq_len) attention masks
             state: (B, max_state_dim) robot state
@@ -523,12 +500,12 @@ class GR3Model(nn.Module):
         device = actions.device
 
         # ── Encode VLM features (shared across diffusion repeats) ──
-        vlm_features = self._encode_vlm(images, img_masks, lang_tokens, lang_masks)
+        vlm_features = self._encode_vlm(pixel_values, image_grid_thw, lang_tokens, lang_masks)
 
         # ── Repeat for multiple diffusion timestep samples ──
         num_repeats = self.config.repeated_diffusion_steps
         actions_rep = actions.repeat(num_repeats, 1, 1)
-        vlm_features_rep = vlm_features.repeat(num_repeats, 1, 1)
+        vlm_features_rep = [f.repeat(num_repeats, 1, 1) for f in vlm_features]
         state_rep = state.repeat(num_repeats, 1)
         b_rep = actions_rep.shape[0]
 
@@ -581,8 +558,8 @@ class GR3Model(nn.Module):
     @torch.no_grad()
     def sample_actions(
         self,
-        images: list[Tensor],
-        img_masks: list[Tensor],
+        pixel_values: Tensor | None,
+        image_grid_thw: Tensor | None,
         lang_tokens: Tensor,
         lang_masks: Tensor,
         state: Tensor,
@@ -590,7 +567,9 @@ class GR3Model(nn.Module):
         """Inference: Euler integration from noise to action.
 
         Args:
-            images, img_masks, lang_tokens, lang_masks: observation inputs
+            pixel_values: (total_patches, C*tp*p*p) from image processor, or None
+            image_grid_thw: (num_images, 3) from image processor, or None
+            lang_tokens, lang_masks: tokenized language inputs
             state: (B, max_state_dim) robot state
 
         Returns:
@@ -600,7 +579,7 @@ class GR3Model(nn.Module):
         batch_size = state.shape[0]
 
         # ── Encode VLM features once ──
-        vlm_features = self._encode_vlm(images, img_masks, lang_tokens, lang_masks)
+        vlm_features = self._encode_vlm(pixel_values, image_grid_thw, lang_tokens, lang_masks)
 
         # ── Initialize from noise ──
         actions = torch.randn(
@@ -608,7 +587,7 @@ class GR3Model(nn.Module):
             self.config.chunk_size,
             self.config.max_action_dim,
             device=device,
-            dtype=vlm_features.dtype,
+            dtype=vlm_features[0].dtype,
         )
 
         # ── State features ──
@@ -687,53 +666,71 @@ class GR3Policy(PreTrainedPolicy):
 
     # ── Image preprocessing ──
 
-    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
-        """Preprocess images for Qwen2.5-VL.
+    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[Tensor | None, Tensor | None]:
+        """Preprocess images for Qwen2.5-VL using the built-in image processor.
 
-        LeRobot images are [B, C, H, W] in [0, 1].
-        Qwen2.5-VL expects [B, C, H, W] normalized per its processor.
+        Collects images from the batch, resizes to target resolution, then
+        delegates CLIP normalization, 3D-patch conversion, and grid_thw
+        computation to ``Qwen2VLImageProcessor``.
+
+        Images are ordered batch-major (all cameras for batch item 0, then
+        batch item 1, …) to match the ``<|image_pad|>`` token order in
+        ``input_ids``.
+
+        Returns:
+            pixel_values: ``(total_patches, C*tp*p*p)`` ready for the VLM, or *None*.
+            image_grid_thw: ``(num_images, 3)`` ready for the VLM, or *None*.
         """
-        images = []
-        img_masks = []
         device = next(self.parameters()).device
+        image_processor = self.model.processor.image_processor
 
         present_keys = [k for k in self.config.image_features if k in batch]
-        missing_keys = [k for k in self.config.image_features if k not in batch]
 
         if not present_keys:
             raise ValueError(
-                f"No image features found in batch. Expected at least one of: {list(self.config.image_features)}"
+                f"No image features found in batch. Expected at least one of: "
+                f"{list(self.config.image_features)}"
             )
 
-        for key in present_keys:
-            img = batch[key].to(device=device, dtype=torch.float32)
+        batch_size = batch[present_keys[0]].shape[0]
+        all_images: list[Tensor] = []
 
-            # Ensure [B, C, H, W]
-            if img.shape[1] != 3 and img.shape[-1] == 3:
-                img = img.permute(0, 3, 1, 2)
+        for b in range(batch_size):
+            for key in present_keys:
+                img = batch[key][b].to(device=device, dtype=torch.float32)  # (C, H, W)
 
-            # Resize if needed
-            if img.shape[2:] != self.config.image_resolution:
-                img = F.interpolate(
-                    img,
-                    size=self.config.image_resolution,
-                    mode="bilinear",
-                    align_corners=False,
-                )
+                # Ensure (C, H, W)
+                if img.shape[0] != 3 and img.shape[-1] == 3:
+                    img = img.permute(2, 0, 1)
 
-            # Normalize to [-1, 1] (standard VLM preprocessing)
-            img = img * 2.0 - 1.0
+                # Resize to target resolution
+                if tuple(img.shape[1:]) != tuple(self.config.image_resolution):
+                    img = F.interpolate(
+                        img.unsqueeze(0),
+                        size=self.config.image_resolution,
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
 
-            images.append(img)
-            img_masks.append(torch.ones(img.shape[0], dtype=torch.bool, device=device))
+                all_images.append(img)
 
-        # Pad missing cameras with zeros
-        for _ in missing_keys:
-            dummy = torch.zeros_like(images[-1]) - 1.0  # fill with -1
-            images.append(dummy)
-            img_masks.append(torch.zeros(dummy.shape[0], dtype=torch.bool, device=device))
+        if not all_images:
+            return None, None
 
-        return images, img_masks
+        # Delegate normalization + 3D-patch conversion + grid computation
+        # to the Qwen2.5-VL image processor. Our images are already [0, 1]
+        # float tensors at the target resolution, so skip resize and rescale.
+        result = image_processor(
+            images=all_images,
+            do_resize=False,
+            do_rescale=False,
+            return_tensors="pt",
+        )
+
+        pixel_values = result["pixel_values"].to(device=device)
+        image_grid_thw = result["image_grid_thw"].to(device=device)
+
+        return pixel_values, image_grid_thw
 
     def _prepare_state(self, batch: dict[str, Tensor]) -> Tensor:
         """Pad state to max_state_dim."""
@@ -769,12 +766,12 @@ class GR3Policy(PreTrainedPolicy):
         """Predict a full chunk of actions."""
         self.eval()
 
-        images, img_masks = self._preprocess_images(batch)
+        pixel_values, image_grid_thw = self._preprocess_images(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         state = self._prepare_state(batch)
 
-        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state)
+        actions = self.model.sample_actions(pixel_values, image_grid_thw, lang_tokens, lang_masks, state)
 
         # Unpad to actual action dim
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -788,14 +785,14 @@ class GR3Policy(PreTrainedPolicy):
         Returns:
             (loss, info_dict) where loss is a scalar tensor.
         """
-        images, img_masks = self._preprocess_images(batch)
+        pixel_values, image_grid_thw = self._preprocess_images(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         state = self._prepare_state(batch)
         actions = self._prepare_action(batch)
 
         # Forward with flow matching loss
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
+        losses = self.model.forward(pixel_values, image_grid_thw, lang_tokens, lang_masks, state, actions)
 
         # Truncate to actual action dims
         original_action_dim = self.config.output_features[ACTION].shape[0]
